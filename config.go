@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -29,11 +30,14 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 }
 
 type Config struct {
-	Listen    string           `json:"listen"`
-	TLS       *TLSConfig       `json:"tls,omitempty"`
-	Gzip      bool             `json:"gzip"`
-	RateLimit *RateLimitConfig `json:"rate_limit,omitempty"`
-	Sites     []SiteConfig     `json:"sites"`
+	Listen string     `json:"listen"`
+	TLS    *TLSConfig `json:"tls,omitempty"`
+	Gzip   bool       `json:"gzip"`
+	// MetricsListen, e.g. "127.0.0.1:9090", serves Prometheus metrics at /metrics.
+	// Keep it on localhost or a private network: it is not authenticated.
+	MetricsListen string           `json:"metrics_listen,omitempty"`
+	RateLimit     *RateLimitConfig `json:"rate_limit,omitempty"`
+	Sites         []SiteConfig     `json:"sites"`
 }
 
 type TLSConfig struct {
@@ -41,6 +45,24 @@ type TLSConfig struct {
 	Cert         string `json:"cert"`
 	Key          string `json:"key"`
 	RedirectHTTP bool   `json:"redirect_http"`
+	// HTTP3 serves HTTP/3 (QUIC) on the same port number over UDP and advertises
+	// it with Alt-Svc. Requires a binary built with: go build -tags http3
+	HTTP3 bool `json:"http3"`
+	// Auto enables automatic certificates via ACME (Let's Encrypt).
+	// Use it instead of cert/key. Needs ports 80 and 443 reachable from the internet.
+	Auto *AutoTLSConfig `json:"auto,omitempty"`
+}
+
+type AutoTLSConfig struct {
+	// Domains to get certificates for. Defaults to every non-wildcard,
+	// non-localhost host used in "sites".
+	Domains  []string `json:"domains"`
+	Email    string   `json:"email"`
+	CacheDir string   `json:"cache_dir"` // where certs/account key are stored (default "portico-certs")
+	// DirectoryURL selects the ACME CA. Defaults to Let's Encrypt production.
+	// Use https://acme-staging-v02.api.letsencrypt.org/directory while testing.
+	DirectoryURL string `json:"directory_url"`
+	CACertFile   string `json:"ca_cert_file"` // extra root CA to trust when talking to the CA (private/test CAs)
 }
 
 type RateLimitConfig struct {
@@ -73,6 +95,17 @@ type ProxyConfig struct {
 	Policy       string             `json:"policy"` // round_robin (default) | least_conn
 	PreserveHost bool               `json:"preserve_host"`
 	HealthCheck  *HealthCheckConfig `json:"health_check,omitempty"`
+	Cache        *CacheConfig       `json:"cache,omitempty"`
+}
+
+// CacheConfig enables an in-memory response cache for a proxy route. Only GET
+// requests without Authorization/Cookie headers are cached, and only responses
+// that allow it (no Set-Cookie, no private/no-store/no-cache, no Vary other than
+// Accept-Encoding). Freshness comes from s-maxage/max-age, else default_ttl.
+type CacheConfig struct {
+	DefaultTTL Duration `json:"default_ttl"`  // 0 = only cache when upstream sends max-age
+	MaxMB      int      `json:"max_mb"`       // total cache size, default 64
+	MaxEntryKB int      `json:"max_entry_kb"` // largest cacheable body, default 1024
 }
 
 type HealthCheckConfig struct {
@@ -109,14 +142,6 @@ func (c *Config) Validate() error {
 	if c.Listen == "" {
 		c.Listen = ":8080"
 	}
-	if c.TLS != nil {
-		if c.TLS.Listen == "" {
-			c.TLS.Listen = ":8443"
-		}
-		if c.TLS.Cert == "" || c.TLS.Key == "" {
-			return errors.New("tls: cert and key are required")
-		}
-	}
 	if rl := c.RateLimit; rl != nil {
 		if rl.RequestsPerSecond <= 0 {
 			return errors.New("rate_limit: requests_per_second must be > 0")
@@ -139,7 +164,78 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	if c.TLS != nil {
+		if err := c.validateTLS(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (c *Config) validateTLS() error {
+	t := c.TLS
+	manual := t.Cert != "" || t.Key != ""
+	switch {
+	case t.Auto != nil && manual:
+		return errors.New("tls: use either auto or cert/key, not both")
+	case t.Auto == nil && (t.Cert == "" || t.Key == ""):
+		return errors.New("tls: set cert and key, or enable auto")
+	}
+	if t.Listen == "" {
+		t.Listen = ":8443"
+		if t.Auto != nil {
+			t.Listen = ":443"
+		}
+	}
+	a := t.Auto
+	if a == nil {
+		return nil
+	}
+	if len(a.Domains) == 0 {
+		a.Domains = c.autoDomains()
+	}
+	if len(a.Domains) == 0 {
+		return errors.New("tls.auto: no domains; set tls.auto.domains or use real host names in sites")
+	}
+	for i, d := range a.Domains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if strings.HasPrefix(d, "*") {
+			return fmt.Errorf("tls.auto: wildcard domain %q needs the DNS-01 challenge, which is not supported", d)
+		}
+		a.Domains[i] = d
+	}
+	if a.CacheDir == "" {
+		a.CacheDir = "portico-certs"
+	}
+	if a.DirectoryURL != "" {
+		if u, err := url.Parse(a.DirectoryURL); err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("tls.auto.directory_url %q must be an https URL", a.DirectoryURL)
+		}
+	}
+	if a.CACertFile != "" {
+		if _, err := os.Stat(a.CACertFile); err != nil {
+			return fmt.Errorf("tls.auto.ca_cert_file: %w", err)
+		}
+	}
+	return nil
+}
+
+// autoDomains lists hosts from the sites that look like public DNS names.
+func (c *Config) autoDomains() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range c.Sites {
+		for _, h := range s.Hosts {
+			h = strings.ToLower(strings.TrimSpace(h))
+			if h == "" || strings.HasPrefix(h, "*") || h == "localhost" ||
+				!strings.Contains(h, ".") || net.ParseIP(h) != nil || seen[h] {
+				continue
+			}
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 func (r *RouteConfig) validate() error {
@@ -187,6 +283,17 @@ func (r *RouteConfig) validate() error {
 		case "", "round_robin", "least_conn":
 		default:
 			return fmt.Errorf("unknown proxy.policy %q (want round_robin or least_conn)", p.Policy)
+		}
+		if cc := p.Cache; cc != nil {
+			if cc.MaxMB <= 0 {
+				cc.MaxMB = 64
+			}
+			if cc.MaxEntryKB <= 0 {
+				cc.MaxEntryKB = 1024
+			}
+			if cc.DefaultTTL < 0 {
+				return errors.New("cache.default_ttl must not be negative")
+			}
 		}
 		if hc := p.HealthCheck; hc != nil {
 			if hc.Path == "" {

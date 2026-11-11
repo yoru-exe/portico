@@ -85,12 +85,15 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-func loggingMiddleware(next http.Handler) http.Handler {
+func loggingMiddleware(m *Metrics, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		m.inflight.Add(1)
+		defer m.inflight.Add(-1)
 		w.Header().Set("Server", "Portico")
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
+		m.observe(sw.status, sw.bytes, time.Since(start))
 		log.Printf("%s %s %s %s -> %d %dB %s",
 			clientIP(r), r.Host, r.Method, r.URL.RequestURI(),
 			sw.status, sw.bytes, time.Since(start).Round(time.Microsecond))

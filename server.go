@@ -25,14 +25,25 @@ import (
 // Runtime is one fully built configuration. A new one is built on every
 // reload and swapped in atomically; the old one is stopped afterwards.
 type Runtime struct {
-	Handler http.Handler
-	stop    context.CancelFunc // stops background work (health checks, cleanup)
+	Handler   http.Handler
+	balancers []*balancer        // exposed for metrics
+	stop      context.CancelFunc // stops background work (health checks, cleanup)
 }
 
 // Server is the http.Handler given to net/http. It forwards to whichever
 // Runtime is current, which is what makes zero-downtime reloads possible.
 type Server struct {
-	rt atomic.Pointer[Runtime]
+	rt      atomic.Pointer[Runtime]
+	metrics *Metrics
+}
+
+func NewServer() *Server { return &Server{metrics: &Metrics{start: time.Now()}} }
+
+// buildCtx carries shared state while a config is turned into handlers.
+type buildCtx struct {
+	ctx       context.Context
+	m         *Metrics
+	balancers []*balancer
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +51,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) Reload(cfg *Config) error {
-	rt, err := Build(cfg)
+	rt, err := Build(cfg, s.metrics)
 	if err != nil {
 		return err
 	}
@@ -51,14 +62,15 @@ func (s *Server) Reload(cfg *Config) error {
 }
 
 // Build turns a validated Config into a handler chain.
-func Build(cfg *Config) (*Runtime, error) {
+func Build(cfg *Config, m *Metrics) (*Runtime, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	bc := &buildCtx{ctx: ctx, m: m}
 	router := &Router{sites: map[string]*Site{}}
 
 	for _, sc := range cfg.Sites {
 		site := &Site{}
 		for _, rc := range sc.Routes {
-			h, err := buildRoute(ctx, rc)
+			h, err := buildRoute(bc, rc)
 			if err != nil {
 				cancel()
 				return nil, err
@@ -91,9 +103,9 @@ func Build(cfg *Config) (*Runtime, error) {
 	if cfg.RateLimit != nil {
 		h = rateLimitMiddleware(ctx, cfg.RateLimit, h)
 	}
-	h = loggingMiddleware(h)
+	h = loggingMiddleware(m, h)
 	h = recoverMiddleware(h)
-	return &Runtime{Handler: h, stop: cancel}, nil
+	return &Runtime{Handler: h, balancers: bc.balancers, stop: cancel}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -155,12 +167,12 @@ func hostOnly(h string) string {
 	return strings.ToLower(h)
 }
 
-func buildRoute(ctx context.Context, rc RouteConfig) (http.Handler, error) {
+func buildRoute(bc *buildCtx, rc RouteConfig) (http.Handler, error) {
 	switch {
 	case rc.Static != nil:
 		return staticHandler(rc), nil
 	case rc.Proxy != nil:
-		return proxyHandler(ctx, rc)
+		return proxyHandler(bc, rc)
 	case rc.Redirect != nil:
 		return redirectHandler(rc.Redirect), nil
 	}
@@ -250,6 +262,8 @@ type upstream struct {
 	proxy   *httputil.ReverseProxy
 	healthy atomic.Bool
 	active  atomic.Int64
+
+	requests, failures atomic.Uint64 // for metrics
 }
 
 func (u *upstream) setHealthy(ok bool) {
@@ -264,6 +278,7 @@ func (u *upstream) setHealthy(ok bool) {
 
 type balancer struct {
 	ups    []*upstream
+	route  string
 	policy string
 	next   atomic.Uint64
 }
@@ -302,19 +317,20 @@ func (b *balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no healthy upstream available", http.StatusServiceUnavailable)
 		return
 	}
+	u.requests.Add(1)
 	u.active.Add(1)
 	defer u.active.Add(-1)
 	u.proxy.ServeHTTP(w, r)
 }
 
-func proxyHandler(ctx context.Context, rc RouteConfig) (http.Handler, error) {
+func proxyHandler(bc *buildCtx, rc RouteConfig) (http.Handler, error) {
 	pc := rc.Proxy
 	strip := ""
 	if rc.StripPrefix {
 		strip = strings.TrimSuffix(rc.Path, "/")
 	}
 
-	b := &balancer{policy: pc.Policy}
+	b := &balancer{policy: pc.Policy, route: rc.Path}
 	for _, raw := range pc.Upstreams {
 		target, err := url.Parse(raw)
 		if err != nil {
@@ -340,6 +356,7 @@ func proxyHandler(ctx context.Context, rc RouteConfig) (http.Handler, error) {
 			},
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 				if !errors.Is(err, context.Canceled) {
+					u.failures.Add(1)
 					log.Printf("proxy error (%s): %v", target.Host, err)
 				}
 				http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -349,9 +366,15 @@ func proxyHandler(ctx context.Context, rc RouteConfig) (http.Handler, error) {
 	}
 
 	if hc := pc.HealthCheck; hc != nil {
-		go b.healthLoop(ctx, hc)
+		go b.healthLoop(bc.ctx, hc)
 	}
-	return b, nil
+	bc.balancers = append(bc.balancers, b)
+
+	var h http.Handler = b
+	if pc.Cache != nil {
+		h = newCache(pc.Cache, bc.m).wrap(h)
+	}
+	return h, nil
 }
 
 func (b *balancer) healthLoop(ctx context.Context, hc *HealthCheckConfig) {

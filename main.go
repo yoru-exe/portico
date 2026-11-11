@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,8 +14,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 const version = "0.1.0"
@@ -33,6 +38,7 @@ Usage:
 const sampleConfig = `{
   "listen": ":8080",
   "gzip": true,
+  "metrics_listen": "127.0.0.1:9090",
   "rate_limit": { "requests_per_second": 50, "burst": 100 },
 
   "sites": [
@@ -45,7 +51,8 @@ const sampleConfig = `{
           "proxy": {
             "upstreams": ["http://localhost:3000", "http://localhost:3001"],
             "policy": "round_robin",
-            "health_check": { "path": "/health", "interval": "10s", "timeout": "2s" }
+            "health_check": { "path": "/health", "interval": "10s", "timeout": "2s" },
+            "cache": { "default_ttl": "30s", "max_mb": 64 }
           }
         },
         {
@@ -188,36 +195,120 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
+// certStore holds the current manual TLS certificate so it can be swapped on reload.
+type certStore struct {
+	cert atomic.Pointer[tls.Certificate]
+}
+
+func (c *certStore) get(*tls.ClientHelloInfo) (*tls.Certificate, error) { return c.cert.Load(), nil }
+
+// newACMEManager builds the autocert manager. The allowed domain list is read
+// through a pointer so a config reload can add or remove domains.
+func newACMEManager(a *AutoTLSConfig, domains *atomic.Pointer[[]string]) (*autocert.Manager, error) {
+	m := &autocert.Manager{
+		Prompt: autocert.AcceptTOS,
+		Email:  a.Email,
+		Cache:  autocert.DirCache(a.CacheDir),
+		HostPolicy: func(_ context.Context, host string) error {
+			host = hostOnly(host) // the HTTP-01 handler passes r.Host, which may carry a port
+			for _, d := range *domains.Load() {
+				if d == host {
+					return nil
+				}
+			}
+			return fmt.Errorf("portico: %q is not one of the configured domains", host)
+		},
+	}
+	if a.DirectoryURL != "" || a.CACertFile != "" {
+		client := &acme.Client{DirectoryURL: a.DirectoryURL}
+		if client.DirectoryURL == "" {
+			client.DirectoryURL = acme.LetsEncryptURL
+		}
+		if a.CACertFile != "" {
+			pem, err := os.ReadFile(a.CACertFile)
+			if err != nil {
+				return nil, err
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return nil, fmt.Errorf("%s: no certificates found", a.CACertFile)
+			}
+			client.HTTPClient = &http.Client{
+				Timeout:   30 * time.Second,
+				Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+			}
+		}
+		m.Client = client
+	}
+	return m, nil
+}
+
 // Run starts the servers and blocks until shutdown.
 func Run(cfg *Config, cfgPath string) error {
-	srv := &Server{}
+	srv := NewServer()
 	if err := srv.Reload(cfg); err != nil {
 		return err
 	}
 
 	var servers []*http.Server
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	httpSrv := newHTTPServer(cfg.Listen, srv)
 
+	var h3srv h3Server
+	var (
+		certs       *certStore               // manual TLS
+		autoDomains atomic.Pointer[[]string] // automatic TLS
+	)
+
 	if cfg.TLS != nil {
-		cert, err := tls.LoadX509KeyPair(cfg.TLS.Cert, cfg.TLS.Key)
-		if err != nil {
-			return fmt.Errorf("loading TLS certificate: %w", err)
-		}
 		tlsSrv := newHTTPServer(cfg.TLS.Listen, srv)
-		tlsSrv.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
+
+		var onHTTP http.Handler = srv // what plain HTTP serves (besides ACME challenges)
+		if cfg.TLS.RedirectHTTP {
+			onHTTP = httpsRedirect(cfg.TLS.Listen)
 		}
+
+		if a := cfg.TLS.Auto; a != nil {
+			autoDomains.Store(&a.Domains)
+			mgr, err := newACMEManager(a, &autoDomains)
+			if err != nil {
+				return err
+			}
+			tlsSrv.TLSConfig = mgr.TLSConfig() // GetCertificate + h2 + acme-tls/1
+			tlsSrv.TLSConfig.MinVersion = tls.VersionTLS12
+			httpSrv.Handler = mgr.HTTPHandler(onHTTP) // answers HTTP-01 challenges
+			log.Printf("automatic HTTPS for %s (certs cached in %s)", strings.Join(a.Domains, ", "), a.CacheDir)
+		} else {
+			certs = &certStore{}
+			cert, err := tls.LoadX509KeyPair(cfg.TLS.Cert, cfg.TLS.Key)
+			if err != nil {
+				return fmt.Errorf("loading TLS certificate: %w", err)
+			}
+			certs.cert.Store(&cert)
+			tlsSrv.TLSConfig = &tls.Config{GetCertificate: certs.get, MinVersion: tls.VersionTLS12}
+			httpSrv.Handler = onHTTP
+		}
+
+		if cfg.TLS.HTTP3 {
+			h3, err := newHTTP3(cfg.TLS.Listen, srv, tlsSrv.TLSConfig.Clone())
+			if err != nil {
+				return err
+			}
+			_, port, _ := net.SplitHostPort(cfg.TLS.Listen)
+			tlsSrv.Handler = altSvc(port, srv) // tell browsers HTTP/3 is available
+			h3srv = h3
+			go func() {
+				log.Printf("http3 listening on %s (udp)", cfg.TLS.Listen)
+				errCh <- h3.ListenAndServe()
+			}()
+		}
+
 		servers = append(servers, tlsSrv)
 		go func() {
 			log.Printf("https listening on %s (HTTP/2 enabled)", cfg.TLS.Listen)
 			errCh <- tlsSrv.ListenAndServeTLS("", "")
 		}()
-		if cfg.TLS.RedirectHTTP {
-			httpSrv.Handler = httpsRedirect(cfg.TLS.Listen)
-		}
 	}
 
 	servers = append(servers, httpSrv)
@@ -225,6 +316,15 @@ func Run(cfg *Config, cfgPath string) error {
 		log.Printf("Portico %s: http listening on %s", version, cfg.Listen)
 		errCh <- httpSrv.ListenAndServe()
 	}()
+
+	if cfg.MetricsListen != "" {
+		ms := newHTTPServer(cfg.MetricsListen, metricsHandler(srv))
+		servers = append(servers, ms)
+		go func() {
+			log.Printf("metrics at http://%s/metrics", cfg.MetricsListen)
+			errCh <- ms.ListenAndServe()
+		}()
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
@@ -240,18 +340,12 @@ func Run(cfg *Config, cfgPath string) error {
 					log.Print("reload ignored: not started from a config file")
 					continue
 				}
-				newCfg, err := LoadConfig(cfgPath)
-				if err != nil {
+				if err := reload(srv, cfgPath, cfg, certs, &autoDomains); err != nil {
+					srv.metrics.reloadFailures.Add(1)
 					log.Printf("reload failed, keeping current config: %v", err)
 					continue
 				}
-				if err := srv.Reload(newCfg); err != nil {
-					log.Printf("reload failed, keeping current config: %v", err)
-					continue
-				}
-				if newCfg.Listen != cfg.Listen || (newCfg.TLS == nil) != (cfg.TLS == nil) {
-					log.Print("note: listen address and TLS settings only change on restart")
-				}
+				srv.metrics.reloads.Add(1)
 				log.Print("config reloaded")
 				continue
 			}
@@ -262,9 +356,57 @@ func Run(cfg *Config, cfgPath string) error {
 			for _, s := range servers {
 				s.Shutdown(ctx)
 			}
+			if h3srv != nil {
+				h3srv.Close()
+			}
 			return nil
 		}
 	}
+}
+
+// reload applies a new config. Everything that can fail is checked before
+// anything is swapped, so a failed reload changes nothing.
+func reload(srv *Server, path string, old *Config, certs *certStore, domains *atomic.Pointer[[]string]) error {
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		return err
+	}
+
+	var newCert *tls.Certificate
+	if certs != nil && cfg.TLS != nil && cfg.TLS.Auto == nil {
+		c, err := tls.LoadX509KeyPair(cfg.TLS.Cert, cfg.TLS.Key)
+		if err != nil {
+			return fmt.Errorf("loading TLS certificate: %w", err)
+		}
+		newCert = &c
+	}
+
+	if err := srv.Reload(cfg); err != nil {
+		return err
+	}
+
+	if newCert != nil {
+		certs.cert.Store(newCert)
+		log.Print("TLS certificate reloaded")
+	}
+	if cfg.TLS != nil && cfg.TLS.Auto != nil && domains.Load() != nil {
+		domains.Store(&cfg.TLS.Auto.Domains)
+	}
+	if cfg.Listen != old.Listen || cfg.MetricsListen != old.MetricsListen ||
+		(cfg.TLS == nil) != (old.TLS == nil) ||
+		(cfg.TLS != nil && old.TLS != nil && (cfg.TLS.Listen != old.TLS.Listen || (cfg.TLS.Auto == nil) != (old.TLS.Auto == nil))) {
+		log.Print("note: listen addresses and the TLS mode only change on restart")
+	}
+	return nil
+}
+
+// altSvc advertises HTTP/3 on the same port number so clients can upgrade.
+func altSvc(port string, next http.Handler) http.Handler {
+	v := fmt.Sprintf(`h3=":%s"; ma=86400`, port)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", v)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func httpsRedirect(tlsAddr string) http.Handler {
