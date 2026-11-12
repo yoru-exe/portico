@@ -1,4 +1,4 @@
-module github.com/you/portico
+module github.com/yoru-exe/portico
 
 go 1.22
 

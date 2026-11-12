@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome to Portico</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; }
+  code, pre { background: rgba(127,127,127,.15); border-radius: 4px; }
+  code { padding: .1em .35em; }
+  pre { padding: .8em 1em; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>Welcome to Portico</h1>
+<p>If you can see this page, the server is installed and running.</p>
+<p>Serve your own site by mounting it at <code>/srv</code>, or mount a config at
+<code>/etc/portico/portico.json</code>:</p>
+<pre>docker run -p 8080:8080 -v ./site:/srv:ro ghcr.io/yoru-exe/portico</pre>
+<p>Docs: <a href="https://github.com/yoru-exe/portico">github.com/yoru-exe/portico</a></p>
+</body>
+</html>

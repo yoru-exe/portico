@@ -1,0 +1,39 @@
+# Example: automatic HTTPS in front of an app.
+# 1. Point your DNS at this machine.   2. Edit portico.json (see below).   3. docker compose up -d
+services:
+  portico:
+    image: ghcr.io/yoru-exe/portico:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    sysctls:
+      # lets the non-root container user bind ports 80/443 (already the default on Docker >= 20.10)
+      - net.ipv4.ip_unprivileged_port_start=0
+    volumes:
+      - ./portico.json:/etc/portico/portico.json:ro
+      - ./site:/srv:ro
+      - portico-data:/data # keeps certificates across restarts
+
+  app:
+    image: traefik/whoami # replace with your own backend
+    restart: unless-stopped
+
+volumes:
+  portico-data:
+
+# portico.json for the setup above:
+# {
+#   "listen": ":80",
+#   "gzip": true,
+#   "tls": { "listen": ":443", "redirect_http": true, "http3": true,
+#            "auto": { "email": "you@example.com" } },
+#   "sites": [{
+#     "hosts": ["example.com"],
+#     "routes": [
+#       { "path": "/api", "strip_prefix": true, "proxy": { "upstreams": ["http://app:80"] } },
+#       { "path": "/",    "static": { "root": "/srv" } }
+#     ]
+#   }]
+# }

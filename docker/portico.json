@@ -1,0 +1,11 @@
+{
+  "listen": ":8080",
+  "gzip": true,
+  "sites": [
+    {
+      "routes": [
+        { "path": "/", "static": { "root": "/srv" } }
+      ]
+    }
+  ]
+}

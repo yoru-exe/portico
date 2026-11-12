@@ -22,9 +22,11 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-const version = "0.1.0"
+// version is set at build time: go build -ldflags "-X main.version=1.2.3"
+var version = "dev"
 
-const usage = `Portico ` + version + ` - a small web server and reverse proxy
+func usage() string {
+	return `Portico ` + version + ` - a small web server and reverse proxy
 
 Usage:
   portico run [-config portico.json]             run from a config file (SIGHUP reloads it)
@@ -34,6 +36,7 @@ Usage:
   portico validate [-config portico.json]        check a config file
   portico version
 `
+}
 
 const sampleConfig = `{
   "listen": ":8080",
@@ -71,7 +74,7 @@ const sampleConfig = `{
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
+		fmt.Fprint(os.Stderr, usage())
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
@@ -91,9 +94,9 @@ func main() {
 	case "version", "-v", "--version":
 		fmt.Println("portico", version)
 	case "help", "-h", "--help":
-		fmt.Print(usage)
+		fmt.Print(usage())
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage())
 		os.Exit(2)
 	}
 	if err != nil {

@@ -29,6 +29,41 @@ Flags go before positional arguments.
 A reload is all-or-nothing: if the new config (or TLS certificate) is invalid, nothing
 changes and the old one keeps serving. Unknown keys are errors, so typos are caught.
 
+## Docker
+
+    docker run -p 8080:8080 ghcr.io/yoru-exe/portico                       # welcome page, like nginx
+    docker run -p 8080:8080 -v ./site:/srv:ro ghcr.io/yoru-exe/portico     # serve your own site
+    docker run -p 8080:8080 -v ./portico.json:/etc/portico/portico.json:ro ghcr.io/yoru-exe/portico
+
+The same image is published to Docker Hub as `yoruexe/portico`
+(`docker run -p 8080:8080 yoruexe/portico`).
+
+Tags: `latest` and `1.2.3` / `1.2` / `1` (releases), `edge` (main branch). Images are
+multi-arch (`linux/amd64`, `linux/arm64`), built `FROM distroless/static` (no shell, ~10 MB),
+run as a non-root user (uid 65532) and include HTTP/3.
+
+| Path in container          | Purpose                                                          |
+|----------------------------|------------------------------------------------------------------|
+| `/etc/portico/portico.json`| config (the default serves `/srv` on port 8080)                  |
+| `/srv`                     | default web root                                                 |
+| `/data`                    | working directory and a volume: ACME certificates are kept here |
+
+Reload without downtime: `docker kill -s HUP <container>`. For automatic HTTPS publish
+`-p 80:80 -p 443:443 -p 443:443/udp`, mount a volume on `/data`, and set
+`--sysctl net.ipv4.ip_unprivileged_port_start=0` so the non-root user can bind 80/443
+(Docker 20.10+ already does this by default). See `docker-compose.yml` for a full example.
+
+Build it yourself: `docker build --build-arg VERSION=dev -t portico .`
+
+### Publishing (maintainers)
+
+Pushing to `main` publishes `ghcr.io/<owner>/portico:edge`; pushing a tag such as `v1.2.3`
+publishes the release tags. The first time, make the package public under
+*Profile -> Packages -> portico -> Package settings -> Change visibility*.
+To also push to Docker Hub, set the repository variable `DOCKERHUB_IMAGE` (`yoruexe/portico`)
+and the secrets `DOCKERHUB_USERNAME` (`yoruexe`) / `DOCKERHUB_TOKEN` (an access token with
+Read & Write scope, from Docker Hub -> Account settings -> Personal access tokens).
+
 ## Automatic HTTPS (Let's Encrypt)
 
     {
@@ -100,3 +135,4 @@ certs, no per-route timeouts, no request coalescing in the cache.
     cache.go       response cache
     metrics.go     Prometheus endpoint
     http3.go       HTTP/3 listener (-tags http3); http3_stub.go is the default build
+    Dockerfile, docker/, docker-compose.yml, .github/workflows/   container image and CI

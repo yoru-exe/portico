@@ -1,0 +1,13 @@
+.git
+.github
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+*.md
+*.zip
+/portico
+/portico-h3
+sandbox.mod
+sandbox.sum
+portico-certs
