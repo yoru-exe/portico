@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"path"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -258,9 +259,30 @@ func (g *gzipWriter) close() {
 	}
 }
 
+// acceptsGzip reports whether an Accept-Encoding header allows gzip,
+// honouring "gzip;q=0" (which means "not acceptable").
+func acceptsGzip(h string) bool {
+	for _, part := range strings.Split(h, ",") {
+		name, params, _ := strings.Cut(strings.TrimSpace(part), ";")
+		if !strings.EqualFold(strings.TrimSpace(name), "gzip") {
+			continue
+		}
+		q := 1.0
+		for _, p := range strings.Split(params, ";") {
+			if k, v, ok := strings.Cut(strings.TrimSpace(p), "="); ok && strings.EqualFold(strings.TrimSpace(k), "q") {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					q = f
+				}
+			}
+		}
+		return q > 0
+	}
+	return false
+}
+
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") ||
+		if !acceptsGzip(r.Header.Get("Accept-Encoding")) ||
 			r.Header.Get("Upgrade") != "" || // WebSockets
 			r.Header.Get("Range") != "" || // byte ranges must not be compressed
 			r.Method == http.MethodHead {
@@ -270,5 +292,36 @@ func gzipMiddleware(next http.Handler) http.Handler {
 		gw := &gzipWriter{ResponseWriter: w}
 		defer gw.close()
 		next.ServeHTTP(gw, r)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Path normalisation
+// ---------------------------------------------------------------------------
+
+// cleanURLPath resolves "." and ".." segments and merges repeated slashes,
+// keeping a trailing slash.
+func cleanURLPath(p string) string {
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && c != "/" {
+		c += "/"
+	}
+	return c
+}
+
+// cleanPathMiddleware normalises the path before routing (like nginx does), so
+// "/api/../admin" is routed, and forwarded upstream, as "/admin" instead of
+// matching the "/api" route and reaching the upstream with dot segments in it.
+func cleanPathMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if strings.HasPrefix(p, "/") && (strings.Contains(p, "//") || strings.Contains(p, "/.")) {
+			if c := cleanURLPath(p); c != p {
+				r2 := r.Clone(r.Context())
+				r2.URL.Path, r2.URL.RawPath = c, ""
+				r = r2
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }

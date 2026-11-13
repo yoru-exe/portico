@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,11 +30,15 @@ func usage() string {
 	return `Portico ` + version + ` - a small web server and reverse proxy
 
 Usage:
-  portico run [-config portico.json]             run from a config file (SIGHUP reloads it)
+  portico run [-config FILE]                     run from a config file (SIGHUP reloads it)
   portico serve [-dir .] [-listen :8080] [-spa]  serve a directory
   portico proxy [-listen :8080] URL...           reverse proxy to one or more upstreams
-  portico init [-config portico.json]            write an example config file
-  portico validate [-config portico.json]        check a config file
+  portico init [-format json|porticofile]        write an example config file
+  portico validate [-config FILE]                check a config file
+  portico adapt [-config Porticofile]            print a Porticofile as JSON
+
+FILE defaults to ./Porticofile, else ./portico.json. Files ending in .json are JSON;
+anything else is the Caddyfile-style format.
   portico version
 `
 }
@@ -72,6 +77,33 @@ const sampleConfig = `{
 }
 `
 
+const samplePorticofile = `# Porticofile: a compact alternative to portico.json.
+# Docs: https://github.com/yoru-exe/portico
+
+# Global options (optional). Add automatic HTTPS with:
+#   listen :80
+#   tls auto you@example.com
+#   redirect_http
+#   http3
+{
+	listen :8080
+	encode gzip
+	metrics 127.0.0.1:9090
+	rate_limit 50 100
+}
+
+localhost, example.test {
+	reverse_proxy /api/* localhost:3000 localhost:3001 {
+		strip_prefix
+		policy round_robin
+		health_check /health 10s 2s
+		cache 30s
+	}
+	redir /old https://example.test/new 301
+	file_server ./public
+}
+`
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage())
@@ -91,6 +123,8 @@ func main() {
 		err = cmdInit(args)
 	case "validate":
 		err = cmdValidate(args)
+	case "adapt":
+		err = cmdAdapt(args)
 	case "version", "-v", "--version":
 		fmt.Println("portico", version)
 	case "help", "-h", "--help":
@@ -107,13 +141,14 @@ func main() {
 
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	path := fs.String("config", "portico.json", "path to config file")
+	path := fs.String("config", "", "path to config file (default: ./Porticofile or ./portico.json)")
 	fs.Parse(args)
-	cfg, err := LoadConfig(*path)
+	p := resolveConfigPath(*path)
+	cfg, err := LoadConfig(p)
 	if err != nil {
 		return err
 	}
-	return Run(cfg, *path)
+	return Run(cfg, p)
 }
 
 func cmdServe(args []string) error {
@@ -165,23 +200,74 @@ func cmdProxy(args []string) error {
 
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	path := fs.String("config", "portico.json", "where to write the config")
+	format := fs.String("format", "json", "json or porticofile")
+	path := fs.String("config", "", "where to write the config (default: portico.json or Porticofile)")
 	fs.Parse(args)
+
+	text, def := sampleConfig, "portico.json"
+	switch *format {
+	case "json":
+	case "porticofile":
+		text, def = samplePorticofile, "Porticofile"
+	default:
+		return fmt.Errorf("unknown format %q (want json or porticofile)", *format)
+	}
+	if *path == "" {
+		*path = def
+	}
 	if _, err := os.Stat(*path); err == nil {
 		return fmt.Errorf("%s already exists", *path)
 	}
-	if err := os.WriteFile(*path, []byte(sampleConfig), 0o644); err != nil {
+	if err := os.WriteFile(*path, []byte(text), 0o644); err != nil {
 		return err
 	}
 	fmt.Println("wrote", *path)
 	return nil
 }
 
+// resolveConfigPath returns the explicit path, else ./Porticofile if it
+// exists, else ./portico.json.
+func resolveConfigPath(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if _, err := os.Stat("Porticofile"); err == nil {
+		return "Porticofile"
+	}
+	return "portico.json"
+}
+
+// cmdAdapt prints a Porticofile as the equivalent JSON, so you can see exactly
+// what it means (and use it as a starting point for the JSON format).
+func cmdAdapt(args []string) error {
+	fs := flag.NewFlagSet("adapt", flag.ExitOnError)
+	path := fs.String("config", "", "Porticofile to convert (default: ./Porticofile)")
+	fs.Parse(args)
+	p := *path
+	if p == "" {
+		p = "Porticofile"
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return err
+	}
+	cfg, err := parsePorticofile(string(data), p)
+	if err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
+}
+
 func cmdValidate(args []string) error {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
-	path := fs.String("config", "portico.json", "path to config file")
+	path := fs.String("config", "", "path to config file (default: ./Porticofile or ./portico.json)")
 	fs.Parse(args)
-	if _, err := LoadConfig(*path); err != nil {
+	if _, err := LoadConfig(resolveConfigPath(*path)); err != nil {
 		return err
 	}
 	fmt.Println("config OK")

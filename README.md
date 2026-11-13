@@ -21,9 +21,9 @@ Flags go before positional arguments.
 
 ## Config file
 
-    portico init          # writes an example portico.json
+    portico init          # writes an example portico.json (or: init -format porticofile)
     portico validate      # checks it
-    portico run           # runs it
+    portico run           # runs it (-config FILE, default ./Porticofile or ./portico.json)
     kill -HUP <pid>       # hot reload, zero downtime
 
 A reload is all-or-nothing: if the new config (or TLS certificate) is invalid, nothing
@@ -63,6 +63,62 @@ publishes the release tags. The first time, make the package public under
 To also push to Docker Hub, set the repository variable `DOCKERHUB_IMAGE` (`yoruexe/portico`)
 and the secrets `DOCKERHUB_USERNAME` (`yoruexe`) / `DOCKERHUB_TOKEN` (an access token with
 Read & Write scope, from Docker Hub -> Account settings -> Personal access tokens).
+
+## Porticofile (Caddyfile-style config)
+
+Prefer something shorter than JSON? Any config file whose name does not end in `.json` is read as a
+**Porticofile**. `portico run` picks up `./Porticofile` automatically (else `./portico.json`).
+
+    portico init -format porticofile   # write an example Porticofile
+    portico validate                   # check it (errors name the file and line)
+    portico adapt                      # print it as the equivalent JSON
+    portico run
+
+```
+# global options (optional, one block, must come with no address)
+{
+	listen :80
+	encode gzip
+	metrics 127.0.0.1:9090
+	rate_limit 50 100            # requests per second, optional burst
+	tls auto you@example.com     # automatic HTTPS
+	redirect_http
+	http3
+}
+
+example.com, www.example.com {
+	reverse_proxy /api/* localhost:3000 localhost:3001 {
+		strip_prefix
+		policy least_conn
+		health_check /health 10s 2s
+		cache 30s
+	}
+	redir /old https://example.com/new 301
+	file_server ./public spa
+}
+```
+
+Everything in the JSON format has an equivalent, and both formats go through the same validation.
+Run `portico adapt` to see exactly what a Porticofile means.
+
+| Directive (inside a site block) | Meaning |
+|---|---|
+| `reverse_proxy [/path/*] upstream... { ... }` | proxy to one or more upstreams (`host:port`, `:port`, or a full URL). Options: `strip_prefix`, `preserve_host`, `policy round_robin\|least_conn`, `health_check <path> [interval [timeout]]`, `cache [ttl] { max_mb N; max_entry_kb N }`, `response_header_timeout <duration>` |
+| `file_server [/path/*] <dir> [spa]` | serve static files; `spa` falls back to `index.html` |
+| `redir [/path/*] <url> [301\|302\|303\|307\|308\|permanent\|temporary]` | redirect; end the URL with `{uri}` to append the original request URI |
+
+| Global option | Meaning |
+|---|---|
+| `listen <addr>` / `https_listen <addr>` / `metrics <addr>` | listen addresses |
+| `encode gzip` | compress text responses |
+| `rate_limit <per-second> [burst]` | per-client-IP rate limit |
+| `tls auto [email] { domains ...; ca <url>; ca_cert <file>; storage <dir> }` | automatic HTTPS (see below) |
+| `tls <cert-file> <key-file>` | your own certificate |
+| `redirect_http`, `http3` | redirect HTTP to HTTPS; serve HTTP/3 (needs a `-tags http3` build) |
+
+Site addresses are host names (`example.com`, `*.example.com`, `localhost`); a bare port such as `:8080`
+or `*` matches any host. A path matcher is `/prefix/*` (or `*` for everything); the longest prefix wins.
+Comments start with `#`; values with spaces go in "double quotes".
 
 ## Automatic HTTPS (Let's Encrypt)
 
@@ -117,6 +173,19 @@ The endpoint is unauthenticated: keep it on localhost or a private network.
 - Redirects, gzip, per-IP rate limiting, access log, panic recovery, graceful shutdown,
   slowloris protection, HTTP/2
 
+### Proxy behaviour worth knowing
+
+- **Failover:** if an upstream refuses connections, the request is retried on the next one
+  (body-less requests such as GET), and the failed upstream is skipped for 10 seconds.
+  Active `health_check`s take upstreams in and out of rotation on top of that.
+- **Timeouts:** connecting to an upstream times out after 5s; waiting for response headers after 60s
+  (`response_header_timeout`, `-1s` disables). Idle upstream connections are pooled (256 per upstream).
+- **Paths** are normalised before routing: `/api/../x` and `//x` become `/x` (like nginx), so a
+  request can't slip past a route or reach an upstream with dot segments in its path.
+  Percent-encoding is preserved (`/api/a%2Fb` with `strip_prefix` reaches the upstream as `/a%2Fb`).
+- The upstream's `Server` header is replaced by Portico's; `X-Forwarded-*` headers are set by Portico
+  and any sent by the client are dropped (so they can't be spoofed).
+
 ## Limits
 
 Listen addresses and the TLS mode (auto/manual) change only on restart. No DNS-01/wildcard
@@ -136,3 +205,8 @@ certs, no per-route timeouts, no request coalescing in the cache.
     metrics.go     Prometheus endpoint
     http3.go       HTTP/3 listener (-tags http3); http3_stub.go is the default build
     Dockerfile, docker/, docker-compose.yml, .github/workflows/   container image and CI
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Dependencies keep their own
+licenses: `golang.org/x/crypto` (BSD-3-Clause) and, in HTTP/3 builds, `quic-go` (MIT).

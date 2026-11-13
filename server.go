@@ -5,15 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"path"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -41,9 +37,19 @@ func NewServer() *Server { return &Server{metrics: &Metrics{start: time.Now()}} 
 
 // buildCtx carries shared state while a config is turned into handlers.
 type buildCtx struct {
-	ctx       context.Context
-	m         *Metrics
-	balancers []*balancer
+	ctx        context.Context
+	cancel     context.CancelFunc
+	m          *Metrics
+	balancers  []*balancer
+	transports []*http.Transport
+}
+
+// stop ends background work and drops idle upstream connections.
+func (bc *buildCtx) stop() {
+	bc.cancel()
+	for _, t := range bc.transports {
+		t.CloseIdleConnections()
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +70,7 @@ func (s *Server) Reload(cfg *Config) error {
 // Build turns a validated Config into a handler chain.
 func Build(cfg *Config, m *Metrics) (*Runtime, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	bc := &buildCtx{ctx: ctx, m: m}
+	bc := &buildCtx{ctx: ctx, cancel: cancel, m: m}
 	router := &Router{sites: map[string]*Site{}}
 
 	for _, sc := range cfg.Sites {
@@ -72,7 +78,7 @@ func Build(cfg *Config, m *Metrics) (*Runtime, error) {
 		for _, rc := range sc.Routes {
 			h, err := buildRoute(bc, rc)
 			if err != nil {
-				cancel()
+				bc.stop()
 				return nil, err
 			}
 			site.routes = append(site.routes, route{prefix: rc.Path, handler: h})
@@ -89,14 +95,14 @@ func Build(cfg *Config, m *Metrics) (*Runtime, error) {
 		for _, h := range hosts {
 			h = strings.ToLower(h)
 			if _, dup := router.sites[h]; dup {
-				cancel()
+				bc.stop()
 				return nil, fmt.Errorf("host %q is configured more than once", h)
 			}
 			router.sites[h] = site
 		}
 	}
 
-	var h http.Handler = router
+	var h http.Handler = cleanPathMiddleware(router)
 	if cfg.Gzip {
 		h = gzipMiddleware(h)
 	}
@@ -105,7 +111,7 @@ func Build(cfg *Config, m *Metrics) (*Runtime, error) {
 	}
 	h = loggingMiddleware(m, h)
 	h = recoverMiddleware(h)
-	return &Runtime{Handler: h, balancers: bc.balancers, stop: cancel}, nil
+	return &Runtime{Handler: h, balancers: bc.balancers, stop: bc.stop}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +170,7 @@ func hostOnly(h string) string {
 		h = host
 	}
 	h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	h = strings.TrimSuffix(h, ".") // "example.com." is the same host as "example.com"
 	return strings.ToLower(h)
 }
 
@@ -251,173 +258,4 @@ func staticHandler(rc RouteConfig) http.Handler {
 		h = http.StripPrefix(prefix, h)
 	}
 	return h
-}
-
-// ---------------------------------------------------------------------------
-// Reverse proxy + load balancing + health checks
-// ---------------------------------------------------------------------------
-
-type upstream struct {
-	target  *url.URL
-	proxy   *httputil.ReverseProxy
-	healthy atomic.Bool
-	active  atomic.Int64
-
-	requests, failures atomic.Uint64 // for metrics
-}
-
-func (u *upstream) setHealthy(ok bool) {
-	if u.healthy.Swap(ok) != ok {
-		if ok {
-			log.Printf("upstream %s is healthy again", u.target.Host)
-		} else {
-			log.Printf("upstream %s marked DOWN", u.target.Host)
-		}
-	}
-}
-
-type balancer struct {
-	ups    []*upstream
-	route  string
-	policy string
-	next   atomic.Uint64
-}
-
-// pick returns a healthy upstream, or nil when none are available.
-func (b *balancer) pick() *upstream {
-	n := uint64(len(b.ups))
-	start := b.next.Add(1) - 1
-
-	if b.policy == "least_conn" {
-		var best *upstream
-		var bestLoad int64
-		for i := uint64(0); i < n; i++ { // rotating start breaks ties fairly
-			u := b.ups[(start+i)%n]
-			if !u.healthy.Load() {
-				continue
-			}
-			if load := u.active.Load(); best == nil || load < bestLoad {
-				best, bestLoad = u, load
-			}
-		}
-		return best
-	}
-
-	for i := uint64(0); i < n; i++ {
-		if u := b.ups[(start+i)%n]; u.healthy.Load() {
-			return u
-		}
-	}
-	return nil
-}
-
-func (b *balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	u := b.pick()
-	if u == nil {
-		http.Error(w, "no healthy upstream available", http.StatusServiceUnavailable)
-		return
-	}
-	u.requests.Add(1)
-	u.active.Add(1)
-	defer u.active.Add(-1)
-	u.proxy.ServeHTTP(w, r)
-}
-
-func proxyHandler(bc *buildCtx, rc RouteConfig) (http.Handler, error) {
-	pc := rc.Proxy
-	strip := ""
-	if rc.StripPrefix {
-		strip = strings.TrimSuffix(rc.Path, "/")
-	}
-
-	b := &balancer{policy: pc.Policy, route: rc.Path}
-	for _, raw := range pc.Upstreams {
-		target, err := url.Parse(raw)
-		if err != nil {
-			return nil, err
-		}
-		u := &upstream{target: target}
-		u.healthy.Store(true) // optimistic until a health check says otherwise
-		u.proxy = &httputil.ReverseProxy{
-			Rewrite: func(pr *httputil.ProxyRequest) {
-				if strip != "" {
-					p := strings.TrimPrefix(pr.Out.URL.Path, strip)
-					if !strings.HasPrefix(p, "/") {
-						p = "/" + p
-					}
-					pr.Out.URL.Path = p
-					pr.Out.URL.RawPath = ""
-				}
-				pr.SetURL(target)
-				pr.SetXForwarded() // sets X-Forwarded-For/Host/Proto, drops spoofed ones
-				if pc.PreserveHost {
-					pr.Out.Host = pr.In.Host
-				}
-			},
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				if !errors.Is(err, context.Canceled) {
-					u.failures.Add(1)
-					log.Printf("proxy error (%s): %v", target.Host, err)
-				}
-				http.Error(w, "bad gateway", http.StatusBadGateway)
-			},
-		}
-		b.ups = append(b.ups, u)
-	}
-
-	if hc := pc.HealthCheck; hc != nil {
-		go b.healthLoop(bc.ctx, hc)
-	}
-	bc.balancers = append(bc.balancers, b)
-
-	var h http.Handler = b
-	if pc.Cache != nil {
-		h = newCache(pc.Cache, bc.m).wrap(h)
-	}
-	return h, nil
-}
-
-func (b *balancer) healthLoop(ctx context.Context, hc *HealthCheckConfig) {
-	client := &http.Client{
-		Timeout: time.Duration(hc.Timeout),
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	check := func() {
-		var wg sync.WaitGroup
-		for _, u := range b.ups {
-			wg.Add(1)
-			go func(u *upstream) {
-				defer wg.Done()
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.target.JoinPath(hc.Path).String(), nil)
-				if err != nil {
-					u.setHealthy(false)
-					return
-				}
-				resp, err := client.Do(req)
-				if err != nil {
-					if ctx.Err() == nil {
-						u.setHealthy(false)
-					}
-					return
-				}
-				resp.Body.Close()
-				u.setHealthy(resp.StatusCode >= 200 && resp.StatusCode < 400)
-			}(u)
-		}
-		wg.Wait()
-	}
-
-	check()
-	t := time.NewTicker(time.Duration(hc.Interval))
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			check()
-		}
-	}
 }

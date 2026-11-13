@@ -95,6 +95,9 @@ func (c *responseCache) cacheable(status int, h http.Header) (time.Duration, boo
 	if h.Get("Set-Cookie") != "" || h.Get("Content-Range") != "" {
 		return 0, false
 	}
+	if strings.HasPrefix(strings.ToLower(h.Get("Content-Type")), "text/event-stream") {
+		return 0, false // streams must never be stored and replayed
+	}
 	// The cache key already includes Accept-Encoding; any other Vary is unsafe.
 	for _, v := range h.Values("Vary") {
 		for _, tok := range strings.Split(v, ",") {

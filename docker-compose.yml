@@ -1,5 +1,5 @@
 # Example: automatic HTTPS in front of an app.
-# 1. Point your DNS at this machine.   2. Edit portico.json (see below).   3. docker compose up -d
+# 1. Point your DNS at this machine.   2. Create ./Porticofile (see the bottom of this file).   3. docker compose up -d
 services:
   portico:
     image: ghcr.io/yoru-exe/portico:latest
@@ -11,8 +11,9 @@ services:
     sysctls:
       # lets the non-root container user bind ports 80/443 (already the default on Docker >= 20.10)
       - net.ipv4.ip_unprivileged_port_start=0
+    command: ["run", "-config", "/etc/portico/Porticofile"]
     volumes:
-      - ./portico.json:/etc/portico/portico.json:ro
+      - ./Porticofile:/etc/portico/Porticofile:ro
       - ./site:/srv:ro
       - portico-data:/data # keeps certificates across restarts
 
@@ -23,17 +24,18 @@ services:
 volumes:
   portico-data:
 
-# portico.json for the setup above:
+# Porticofile for the setup above:
 # {
-#   "listen": ":80",
-#   "gzip": true,
-#   "tls": { "listen": ":443", "redirect_http": true, "http3": true,
-#            "auto": { "email": "you@example.com" } },
-#   "sites": [{
-#     "hosts": ["example.com"],
-#     "routes": [
-#       { "path": "/api", "strip_prefix": true, "proxy": { "upstreams": ["http://app:80"] } },
-#       { "path": "/",    "static": { "root": "/srv" } }
-#     ]
-#   }]
+#   listen :80
+#   tls auto you@example.com
+#   redirect_http
+#   http3
+#   encode gzip
+# }
+#
+# example.com {
+#   reverse_proxy /api/* app:80 {
+#     strip_prefix
+#   }
+#   file_server /srv
 # }

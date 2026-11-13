@@ -5,16 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 // Duration is a time.Duration that is written as a string in JSON, e.g. "10s".
 type Duration time.Duration
+
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
 
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	var s string
@@ -41,9 +47,9 @@ type Config struct {
 }
 
 type TLSConfig struct {
-	Listen       string `json:"listen"`
-	Cert         string `json:"cert"`
-	Key          string `json:"key"`
+	Listen       string `json:"listen,omitempty"`
+	Cert         string `json:"cert,omitempty"`
+	Key          string `json:"key,omitempty"`
 	RedirectHTTP bool   `json:"redirect_http"`
 	// HTTP3 serves HTTP/3 (QUIC) on the same port number over UDP and advertises
 	// it with Alt-Svc. Requires a binary built with: go build -tags http3
@@ -56,13 +62,13 @@ type TLSConfig struct {
 type AutoTLSConfig struct {
 	// Domains to get certificates for. Defaults to every non-wildcard,
 	// non-localhost host used in "sites".
-	Domains  []string `json:"domains"`
-	Email    string   `json:"email"`
-	CacheDir string   `json:"cache_dir"` // where certs/account key are stored (default "portico-certs")
+	Domains  []string `json:"domains,omitempty"`
+	Email    string   `json:"email,omitempty"`
+	CacheDir string   `json:"cache_dir,omitempty"` // where certs/account key are stored (default "portico-certs")
 	// DirectoryURL selects the ACME CA. Defaults to Let's Encrypt production.
 	// Use https://acme-staging-v02.api.letsencrypt.org/directory while testing.
-	DirectoryURL string `json:"directory_url"`
-	CACertFile   string `json:"ca_cert_file"` // extra root CA to trust when talking to the CA (private/test CAs)
+	DirectoryURL string `json:"directory_url,omitempty"`
+	CACertFile   string `json:"ca_cert_file,omitempty"` // extra root CA to trust when talking to the CA (private/test CAs)
 }
 
 type RateLimitConfig struct {
@@ -79,7 +85,7 @@ type SiteConfig struct {
 
 type RouteConfig struct {
 	Path        string          `json:"path"`
-	StripPrefix bool            `json:"strip_prefix"` // proxy only
+	StripPrefix bool            `json:"strip_prefix,omitempty"` // proxy only
 	Static      *StaticConfig   `json:"static,omitempty"`
 	Proxy       *ProxyConfig    `json:"proxy,omitempty"`
 	Redirect    *RedirectConfig `json:"redirect,omitempty"`
@@ -91,11 +97,14 @@ type StaticConfig struct {
 }
 
 type ProxyConfig struct {
-	Upstreams    []string           `json:"upstreams"`
-	Policy       string             `json:"policy"` // round_robin (default) | least_conn
-	PreserveHost bool               `json:"preserve_host"`
-	HealthCheck  *HealthCheckConfig `json:"health_check,omitempty"`
-	Cache        *CacheConfig       `json:"cache,omitempty"`
+	Upstreams    []string `json:"upstreams"`
+	Policy       string   `json:"policy"` // round_robin (default) | least_conn
+	PreserveHost bool     `json:"preserve_host,omitempty"`
+	// ResponseHeaderTimeout is how long to wait for an upstream to start
+	// responding. Default 60s; a negative value (e.g. "-1s") disables it.
+	ResponseHeaderTimeout Duration           `json:"response_header_timeout,omitempty"`
+	HealthCheck           *HealthCheckConfig `json:"health_check,omitempty"`
+	Cache                 *CacheConfig       `json:"cache,omitempty"`
 }
 
 // CacheConfig enables an in-memory response cache for a proxy route. Only GET
@@ -103,9 +112,9 @@ type ProxyConfig struct {
 // that allow it (no Set-Cookie, no private/no-store/no-cache, no Vary other than
 // Accept-Encoding). Freshness comes from s-maxage/max-age, else default_ttl.
 type CacheConfig struct {
-	DefaultTTL Duration `json:"default_ttl"`  // 0 = only cache when upstream sends max-age
-	MaxMB      int      `json:"max_mb"`       // total cache size, default 64
-	MaxEntryKB int      `json:"max_entry_kb"` // largest cacheable body, default 1024
+	DefaultTTL Duration `json:"default_ttl,omitempty"`  // 0 = only cache when upstream sends max-age
+	MaxMB      int      `json:"max_mb,omitempty"`       // total cache size, default 64
+	MaxEntryKB int      `json:"max_entry_kb,omitempty"` // largest cacheable body, default 1024
 }
 
 type HealthCheckConfig struct {
@@ -120,16 +129,45 @@ type RedirectConfig struct {
 	KeepPath bool   `json:"keep_path"`
 }
 
+func (p *ProxyConfig) responseHeaderTimeout() time.Duration {
+	switch d := time.Duration(p.ResponseHeaderTimeout); {
+	case d == 0:
+		return defaultResponseHeaderTimeout
+	case d < 0:
+		return 0 // no timeout
+	default:
+		return d
+	}
+}
+
+// LoadConfig reads a config file. Files ending in .json are JSON; anything
+// else (e.g. "Porticofile") is the Caddyfile-style format.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	if !strings.EqualFold(filepath.Ext(path), ".json") {
+		cfg, err := parsePorticofile(string(data), path)
+		if err != nil {
+			return nil, err
+		}
+		if err := cfg.Validate(); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		return cfg, nil
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields() // catch typos in the config
 	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%s: config file is empty", path)
+		}
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: unexpected data after the config object", path)
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)

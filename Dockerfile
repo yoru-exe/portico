@@ -27,9 +27,11 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 LABEL org.opencontainers.image.title="Portico" \
       org.opencontainers.image.description="A small web server and reverse proxy with automatic HTTPS" \
-      org.opencontainers.image.source="https://github.com/yoru-exe/portico"
+      org.opencontainers.image.source="https://github.com/yoru-exe/portico" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=build /out/portico /usr/local/bin/portico
+COPY LICENSE NOTICE /usr/share/doc/portico/
 COPY docker/portico.json /etc/portico/portico.json
 COPY --chown=65532:65532 docker/index.html /srv/index.html
 COPY --from=build --chown=65532:65532 /out/data /data

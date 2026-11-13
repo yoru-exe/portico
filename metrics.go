@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -32,6 +33,9 @@ func (m *Metrics) observe(status int, bytes int64, d time.Duration) {
 	}
 	m.durNanos.Add(uint64(d))
 }
+
+// labelEscaper escapes label values for the Prometheus text format.
+var labelEscaper = strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\n", "\\n")
 
 // metricsHandler renders Prometheus text format.
 func metricsHandler(s *Server) http.Handler {
@@ -87,11 +91,11 @@ func metricsHandler(s *Server) http.Handler {
 			for _, b := range rt.balancers {
 				for _, u := range b.ups {
 					h := 0
-					if u.healthy.Load() {
+					if u.available(time.Now()) {
 						h = 1
 					}
 					rows = append(rows, row{
-						label:    fmt.Sprintf(`route="%s",upstream="%s"`, b.route, u.target.Host),
+						label:    fmt.Sprintf(`route="%s",upstream="%s"`, labelEscaper.Replace(b.route), labelEscaper.Replace(u.target.Host)),
 						healthy:  h,
 						active:   u.active.Load(),
 						requests: u.requests.Load(),
