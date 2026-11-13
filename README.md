@@ -206,6 +206,10 @@ certs, no per-route timeouts, no request coalescing in the cache.
     http3.go       HTTP/3 listener (-tags http3); http3_stub.go is the default build
     Dockerfile, docker/, docker-compose.yml, .github/workflows/   container image and CI
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+
 ## License
 
 Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Dependencies keep their own
