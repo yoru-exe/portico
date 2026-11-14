@@ -56,8 +56,8 @@ changes and the old one keeps serving. Unknown keys are errors, so typos are cau
 
 The same image is published to GitHub Container Registry as `ghcr.io/yoru-exe/portico`.
 
-Tags: `latest`, `0.2.0` and `0.2` (releases), and `edge` (the main branch). From 1.0 onwards a
-major-version tag such as `1` is published too. Images are
+Tags: `latest`, the exact version (for example `0.2.1`) and its minor line (`0.2`) for releases, and
+`edge` for the main branch. From 1.0 onwards a major-version tag such as `1` is published too. Images are
 multi-arch (`linux/amd64`, `linux/arm64`), built `FROM distroless/static` (no shell, ~10 MB),
 run as a non-root user (uid 65532) and include HTTP/3.
 

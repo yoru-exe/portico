@@ -9,11 +9,19 @@ called out under **Changed**.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-14
+
+Fixes the Docker Hub image publishing. The 0.2.0 release was only published to GitHub Container
+Registry, so use 0.2.1 (or `latest`) from Docker Hub.
+
 ### Fixed
 - Docker Hub publishing is now enabled by the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository
   secrets alone (the image defaults to `<username>/portico`). Previously it also required the
   `DOCKERHUB_IMAGE` variable and was silently skipped when that was missing or in the wrong place.
   The workflow summary now states whether Docker Hub is enabled and which secret is missing.
+
+### Changed
+- README: install section, feature list and badges; corrected Docker tags, limits and file layout.
 
 ## [0.2.0] - 2026-11-13
 
@@ -87,6 +95,7 @@ First release.
 - Multi-arch (amd64, arm64) non-root Docker image published to GitHub Container Registry, with
   GitHub Actions workflows for tests and image publishing.
 
-[Unreleased]: https://github.com/yoru-exe/portico/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/yoru-exe/portico/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/yoru-exe/portico/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yoru-exe/portico/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yoru-exe/portico/releases/tag/v0.1.0
