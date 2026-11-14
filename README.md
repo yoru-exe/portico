@@ -60,9 +60,11 @@ Build it yourself: `docker build --build-arg VERSION=dev -t portico .`
 Pushing to `main` publishes `ghcr.io/<owner>/portico:edge`; pushing a tag such as `v1.2.3`
 publishes the release tags. The first time, make the package public under
 *Profile -> Packages -> portico -> Package settings -> Change visibility*.
-To also push to Docker Hub, set the repository variable `DOCKERHUB_IMAGE` (`yoruexe/portico`)
-and the secrets `DOCKERHUB_USERNAME` (`yoruexe`) / `DOCKERHUB_TOKEN` (an access token with
-Read & Write scope, from Docker Hub -> Account settings -> Personal access tokens).
+To also push to Docker Hub, add two **repository secrets** (*Settings -> Secrets and variables ->
+Actions -> Secrets*): `DOCKERHUB_USERNAME` (`yoruexe`) and `DOCKERHUB_TOKEN` (an access token with
+Read & Write scope, from Docker Hub -> Account settings -> Personal access tokens). The image is
+published as `<username>/portico`; set the optional repository *variable* `DOCKERHUB_IMAGE` to use a
+different name. Each run's summary page shows whether Docker Hub is enabled and, if not, which secret is missing.
 
 ## Porticofile (Caddyfile-style config)
 

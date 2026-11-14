@@ -16,10 +16,34 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-latest
+    env:
+      # Docker Hub is used when BOTH repository secrets DOCKERHUB_USERNAME and
+      # DOCKERHUB_TOKEN exist (they are empty on pull requests from forks).
+      DH_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      # The image defaults to <username>/portico; the repository variable
+      # DOCKERHUB_IMAGE overrides it (optional).
+      DH_IMAGE: ${{ vars.DOCKERHUB_IMAGE != '' && vars.DOCKERHUB_IMAGE || format('{0}/portico', secrets.DOCKERHUB_USERNAME) }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
+
+      - name: Report registry targets
+        shell: bash
+        env:
+          HAS_USERNAME: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          HAS_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          {
+            echo "### Registries"
+            echo "- GitHub Container Registry: \`ghcr.io/${GITHUB_REPOSITORY,,}\`"
+            if [ "$DH_ENABLED" = "true" ]; then
+              echo "- Docker Hub: **enabled** (\`$DH_IMAGE\`)"
+            else
+              echo "- Docker Hub: **disabled**. Repository secret DOCKERHUB_USERNAME present: $HAS_USERNAME; DOCKERHUB_TOKEN present: $HAS_TOKEN"
+              echo "  (secrets must be under Settings > Secrets and variables > Actions > Secrets > Repository secrets)"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -29,12 +53,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Optional: also publish to Docker Hub. Set the repository variable
-      # DOCKERHUB_IMAGE (e.g. "yoruexe/portico") and the secrets
+      # Optional: also publish to Docker Hub. Add the repository secrets
       # DOCKERHUB_USERNAME (e.g. "yoruexe") and DOCKERHUB_TOKEN (an access token
-      # with Read & Write scope). Skipped when the variable is empty.
+      # with Read & Write scope). Skipped when either is missing.
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request' && vars.DOCKERHUB_IMAGE != ''
+        if: github.event_name != 'pull_request' && env.DH_ENABLED == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -46,7 +69,7 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository }}
-            ${{ vars.DOCKERHUB_IMAGE }}
+            ${{ env.DH_ENABLED == 'true' && env.DH_IMAGE || '' }}
           tags: |
             type=edge,branch=main
             type=semver,pattern={{version}}

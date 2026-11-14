@@ -9,6 +9,12 @@ called out under **Changed**.
 
 ## [Unreleased]
 
+### Fixed
+- Docker Hub publishing is now enabled by the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository
+  secrets alone (the image defaults to `<username>/portico`). Previously it also required the
+  `DOCKERHUB_IMAGE` variable and was silently skipped when that was missing or in the wrong place.
+  The workflow summary now states whether Docker Hub is enabled and which secret is missing.
+
 ## [0.2.0] - 2026-11-13
 
 A reliability release: a compact new config format, much better proxy failover and connection
