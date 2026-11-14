@@ -1,14 +1,31 @@
 # Portico
 
+[![ci](https://github.com/yoru-exe/portico/actions/workflows/ci.yml/badge.svg)](https://github.com/yoru-exe/portico/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Docker pulls](https://img.shields.io/docker/pulls/yoruexe/portico)](https://hub.docker.com/r/yoruexe/portico)
+
 A small web server and reverse proxy written in Go. One binary, automatic HTTPS, hot reload.
 
-## Build
+- Static sites, single-page apps, and a reverse proxy with load balancing, health checks and failover
+- Automatic HTTPS from Let's Encrypt, HTTP/2, and optional HTTP/3
+- A short Caddyfile-style config (the Porticofile) or JSON, with zero-downtime reload
+- Response cache, gzip, rate limiting and Prometheus metrics
+- A small (about 10 MB) multi-arch Docker image that runs as a non-root user
 
-    go mod tidy                      # once: downloads dependencies and writes go.sum
-    go build -o portico .            # standard build
-    go build -tags http3 -o portico . # optional: adds HTTP/3 (QUIC), ~2 MB larger
+## Install
+
+**Docker** (the image is on Docker Hub and on GitHub Container Registry):
+
+    docker run -p 8080:8080 yoruexe/portico                     # welcome page
+    docker run -p 8080:8080 -v "$PWD/site:/srv:ro" yoruexe/portico   # serve your own site
+
+**From source** (Go 1.22 or newer):
+
+    go build -o portico .              # standard build
+    go build -tags http3 -o portico .  # optional: adds HTTP/3 (QUIC), about 2 MB larger
 
 Dependencies: `golang.org/x/crypto` (automatic certificates) and, only with `-tags http3`, `quic-go`.
+`go.sum` is committed, so no extra setup is needed.
 
 ## Quick start
 
@@ -31,14 +48,16 @@ changes and the old one keeps serving. Unknown keys are errors, so typos are cau
 
 ## Docker
 
-    docker run -p 8080:8080 ghcr.io/yoru-exe/portico                       # welcome page, like nginx
-    docker run -p 8080:8080 -v ./site:/srv:ro ghcr.io/yoru-exe/portico     # serve your own site
-    docker run -p 8080:8080 -v ./portico.json:/etc/portico/portico.json:ro ghcr.io/yoru-exe/portico
+    docker run -p 8080:8080 yoruexe/portico                                           # welcome page, like nginx
+    docker run -p 8080:8080 -v "$PWD/site:/srv:ro" yoruexe/portico                         # serve your own site
+    docker run -p 8080:8080 -v "$PWD/portico.json:/etc/portico/portico.json:ro" yoruexe/portico
+    docker run -p 8080:8080 -v "$PWD/Porticofile:/etc/portico/Porticofile:ro" \
+      yoruexe/portico run -config /etc/portico/Porticofile                            # Caddyfile-style config
 
-The same image is published to Docker Hub as `yoruexe/portico`
-(`docker run -p 8080:8080 yoruexe/portico`).
+The same image is published to GitHub Container Registry as `ghcr.io/yoru-exe/portico`.
 
-Tags: `latest` and `1.2.3` / `1.2` / `1` (releases), `edge` (main branch). Images are
+Tags: `latest`, `0.2.0` and `0.2` (releases), and `edge` (the main branch). From 1.0 onwards a
+major-version tag such as `1` is published too. Images are
 multi-arch (`linux/amd64`, `linux/arm64`), built `FROM distroless/static` (no shell, ~10 MB),
 run as a non-root user (uid 65532) and include HTTP/3.
 
@@ -191,22 +210,29 @@ The endpoint is unauthenticated: keep it on localhost or a private network.
 ## Limits
 
 Listen addresses and the TLS mode (auto/manual) change only on restart. No DNS-01/wildcard
-certs, no per-route timeouts, no request coalescing in the cache.
+certs. Only connect, response-header and idle timeouts exist (no limit on total request or body
+time). The cache does no request coalescing: a burst of requests for an expired popular URL
+all reach the upstream. Failover retries requests without a body only.
 
 ## Tests
 
     go test -race ./...
+    go test -race -tags http3 ./...
 
 ## Layout
 
-    main.go        CLI, startup, signals, TLS and ACME, reload
-    config.go      config structs, validation, defaults
-    server.go      hot-reload runtime, routing, static, proxy, balancer, health checks
-    middleware.go  recover, access log, rate limit, gzip
-    cache.go       response cache
-    metrics.go     Prometheus endpoint
-    http3.go       HTTP/3 listener (-tags http3); http3_stub.go is the default build
+    main.go          CLI, startup, signals, TLS and ACME, reload
+    config.go        config structs, validation, defaults, JSON loading
+    porticofile.go   the Caddyfile-style config: lexer, parser, adapter
+    server.go        hot-reload runtime, routing, static files, redirects
+    proxy.go         reverse proxy, load balancing, failover, health checks
+    middleware.go    recover, access log, rate limit, gzip, path cleaning
+    cache.go         response cache
+    metrics.go       Prometheus endpoint
+    http3.go         HTTP/3 listener (-tags http3); http3_stub.go is the default build
+    *_test.go        unit and integration tests
     Dockerfile, docker/, docker-compose.yml, .github/workflows/   container image and CI
+    CHANGELOG.md, LICENSE, NOTICE
 
 ## Changelog
 
